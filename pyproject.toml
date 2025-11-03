@@ -1,0 +1,22 @@
+[project]
+name = "dual-fret-notebook"
+version = "0.1.0"
+description = "Notebook for dual-sensor FRET simulation and fitting"
+authors = [{ name = "Abhinav Mishra" }]
+requires-python = ">=3.10"
+
+dependencies = [
+    "numpy",
+    "scipy",
+    "pandas",
+    "matplotlib",
+    "tqdm",
+    "notebook",
+]
+
+[tool.uv]
+dev = ["ipykernel"]
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
