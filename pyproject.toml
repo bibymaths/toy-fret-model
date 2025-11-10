@@ -13,6 +13,8 @@ dependencies = [
     "tqdm",
     "notebook",
     "tables>=3.10.1",
+    "numba>=0.62.1",
+    "joblib>=1.5.2",
 ]
 
 [tool.uv]

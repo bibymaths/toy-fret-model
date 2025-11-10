@@ -2,10 +2,12 @@ import numpy as np
 import pandas as pd
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Tuple, List
+from typing import Tuple, List, Optional
 from scipy.integrate import solve_ivp
 from scipy.optimize import curve_fit
 import matplotlib.pyplot as plt
+from numba import njit
+from joblib import Parallel, delayed
 
 # ----------------------------------------------------------------------
 # Extended Model: Three-state Hsp90 dynamics + bleaching
@@ -68,6 +70,19 @@ def rhs_hsp90_3state(t: float, y: np.ndarray, p: Hsp90Params3State) -> np.ndarra
     return np.array([dP_O, dP_I, dP_C], dtype=float)
 
 
+@njit("float64[:](float64, float64[:], float64[:])", cache=True, fastmath=False, nogil=False)
+def rhs_hsp90_numba(t: float, y: np.ndarray, params: np.ndarray) -> np.ndarray:
+    # Unpack params array for speed (avoiding python object attribute access)
+    k_OI, k_IO, k_IC, k_CI, k_B = params[0], params[1], params[2], params[3], params[4]
+
+    P_O, P_I, P_C = y[0], y[1], y[2]
+
+    dP_O = -k_OI * P_O + k_IO * P_I - k_B * P_O
+    dP_I = k_OI * P_O - (k_IO + k_IC + k_B) * P_I + k_CI * P_C
+    dP_C = k_IC * P_I - k_CI * P_C - k_B * P_C
+
+    return np.array([dP_O, dP_I, dP_C], dtype=np.float64)
+
 def model_fret_3state(t_eval: np.ndarray, p: Hsp90Params3State) -> np.ndarray:
     """
     Dynamic part only: E_dyn(t) = E_O*P_O + E_I*P_I + E_C*P_C.
@@ -82,16 +97,18 @@ def model_fret_3state(t_eval: np.ndarray, p: Hsp90Params3State) -> np.ndarray:
         P_C0 = P_C0 / total * 0.001
         P_I0 = 1.0 - P_O0 - P_C0
 
-    y0 = [P_O0, P_I0, P_C0]
+    # y0 = [P_O0, P_I0, P_C0]
+    k_params = np.array([p.k_OI, p.k_IO, p.k_IC, p.k_CI, p.k_B], dtype=float)
+    y0 = np.array([P_O0, P_I0, P_C0], dtype=float)
 
     sol = solve_ivp(
-        fun=lambda t, y: rhs_hsp90_3state(t, y, p),
+        fun=rhs_hsp90_numba,
         t_span=(t_eval.min(), t_eval.max()),
         y0=y0,
         t_eval=t_eval,
         vectorized=False,
-        # atol=1e-8,
-        # rtol=1e-8,
+        args=(k_params,),  # <--- CRITICAL FIX: Must be a tuple
+        method='RK45'
     )
 
     if not sol.success:
@@ -263,6 +280,50 @@ def compute_ensemble_metrics(
         n_traj=int(E_mat.shape[1]),
     )
 
+def _fit_single_condition_worker(
+        key: str,
+        t: np.ndarray,
+        E_mat: np.ndarray,
+        col_names: List[str],
+        meta: pd.DataFrame,
+        group_by: str
+) -> Optional[Tuple[str, Hsp90Fit3State, dict]]:
+    """
+    Internal worker for parallel fitting of a single condition.
+    """
+    cols_subset = meta.loc[meta[group_by] == key, "col"].tolist()
+    if not cols_subset:
+        return None
+
+    try:
+        # 1. Subset data for this specific condition
+        t_sub, E_sub = subset_matrix_by_columns(t, E_mat, col_names, cols_subset)
+
+        # 2. Perform the heavy computational fit
+        fit = fit_global_3state(t_sub, E_sub)
+
+        # 3. Compute metrics
+        metrics = compute_ensemble_metrics(t_sub, E_sub, fit)
+
+        # 4. Pack results into a dictionary record
+        p = fit.params
+        rec = dict(
+            group_by=group_by,
+            group_key=key,
+            n_traj=metrics["n_traj"],
+            n_time=metrics["n_time"],
+            rmse=metrics["rmse"],
+            r2=metrics["r2"],
+            k_OI=p.k_OI, k_IO=p.k_IO, k_IC=p.k_IC, k_CI=p.k_CI, k_B=p.k_B,
+            E_open=p.E_open, E_inter=p.E_inter, E_closed=p.E_closed,
+            P_O0=p.P_O0, P_C0=p.P_C0,
+            f_dyn=fit.f_dyn, E_static=fit.E_static,
+        )
+        return (key, fit, rec)
+
+    except Exception as e:
+        print(f"  Fit failed for group '{key}': {e}")
+        return None
 
 def fit_all_conditions(
     t: np.ndarray,
@@ -302,79 +363,55 @@ def fit_all_conditions(
     """
     meta = parse_column_metadata(col_names)
     if group_by not in meta.columns:
-        raise ValueError(f"group_by must be one of {', '.join(['condition','construct','exp_id'])}")
+        raise ValueError(f"group_by must be one of {', '.join(['condition', 'construct', 'exp_id'])}")
 
     group_keys = sorted(meta[group_by].unique())
-    fits = []
+    print(f"Starting parallel fit for {len(group_keys)} groups...")
+
+    # --- PARALLEL FITTING ---
+    # n_jobs=-1 uses all available CPU cores.
+    # verbose=1 provides a progress update in the console.
+    results = Parallel(n_jobs=-1, verbose=5)(
+        delayed(_fit_single_condition_worker)(
+            key, t, E_mat, col_names, meta, group_by
+        ) for key in group_keys
+    )
+    # ------------------------
+
+    # Unpack results from parallel workers
+    fits_list = []
     fit_dict = {}
+    for res in results:
+        if res is not None:
+            key, fit, rec = res
+            fit_dict[key] = fit
+            fits_list.append(rec)
 
-    for key in group_keys:
-        cols_subset = meta.loc[meta[group_by] == key, "col"].tolist()
-        if not cols_subset:
-            continue
+    # Create summary DataFrame
+    if not fits_list:
+        summary_df = pd.DataFrame(columns=[
+            "group_by", "group_key", "n_traj", "n_time", "rmse", "r2",
+            "k_OI", "k_IO", "k_IC", "k_CI", "k_B",
+            "E_open", "E_inter", "E_closed", "P_O0", "P_C0", "f_dyn", "E_static"
+        ])
+    else:
+        summary_df = pd.DataFrame(fits_list)
 
-        print(f"\nFitting group '{group_by} = {key}' with {len(cols_subset)} trajectories...")
-        try:
-            t_sub, E_sub = subset_matrix_by_columns(t, E_mat, col_names, cols_subset)
-        except ValueError as e:
-            print(f"  Skipping {key}: {e}")
-            continue
+    # --- SEQUENTIAL PLOTTING (if requested) ---
+    # Must be done serially because Matplotlib is not thread-safe.
+    if do_plots and fit_dict:
+        print("\nGenerating requested plots sequentially...")
+        for key in sorted(fit_dict.keys()):
+            print(f"  Plotting {key}...")
+            # Re-subset data just for plotting
+            cols = meta.loc[meta[group_by] == key, "col"].tolist()
+            t_sub, E_sub = subset_matrix_by_columns(t, E_mat, col_names, cols)
 
-        # Fit model to this condition’s ensemble mean
-        fit = fit_global_3state(t_sub, E_sub)
-        fit_dict[key] = fit
-
-        # Compute goodness-of-fit metrics
-        metrics = compute_ensemble_metrics(t_sub, E_sub, fit)
-
-        # Flatten parameters into a record
-        p = fit.params
-        rec = dict(
-            group_by=group_by,
-            group_key=key,
-            n_traj=metrics["n_traj"],
-            n_time=metrics["n_time"],
-            rmse=metrics["rmse"],
-            r2=metrics["r2"],
-            k_OI=p.k_OI,
-            k_IO=p.k_IO,
-            k_IC=p.k_IC,
-            k_CI=p.k_CI,
-            k_B=p.k_B,
-            E_open=p.E_open,
-            E_inter=p.E_inter,
-            E_closed=p.E_closed,
-            P_O0=p.P_O0,
-            P_C0=p.P_C0,
-            f_dyn=fit.f_dyn,
-            E_static=fit.E_static,
-        )
-        fits.append(rec)
-
-        # Optional per-condition time plot
-        if do_plots:
-            print(f"  Plotting time-course for {key}...")
             plot_hsp90_fit_time(
-                t_sub,
-                E_sub,
-                fit,
+                t_sub, E_sub, fit_dict[key],
                 n_traces_overlay=max_overlay_traces,
                 random_seed=0,
             )
-
-    if not fits:
-        summary_df = pd.DataFrame(
-            columns=[
-                "group_by", "group_key", "n_traj", "n_time",
-                "rmse", "r2",
-                "k_OI", "k_IO", "k_IC", "k_CI", "k_B",
-                "E_open", "E_inter", "E_closed",
-                "P_O0", "P_C0",
-                "f_dyn", "E_static",
-            ]
-        )
-    else:
-        summary_df = pd.DataFrame(fits)
 
     return summary_df, fit_dict
 
@@ -590,6 +627,47 @@ def plot_hsp90_fit_time(
     plt.tight_layout()
     plt.show()
 
+
+def _bootstrap_worker(
+        t_sub: np.ndarray,
+        E_sub: np.ndarray,
+        seed: int
+) -> Optional[dict]:
+    """
+    Internal worker for a single bootstrap resample and fit.
+    """
+    try:
+        # 1. Create a local RNG for this worker
+        rng = np.random.default_rng(seed)
+
+        # 2. Resample trajectories with replacement
+        idx_boot = rng.integers(0, E_sub.shape[1], size=E_sub.shape[1])
+        E_boot = E_sub[:, idx_boot]
+
+        # 3. Fit the resampled data
+        fit_b = fit_global_3state(t_sub, E_boot)
+
+        # 4. Pack results
+        p = fit_b.params
+        rec = dict(
+            k_OI=p.k_OI,
+            k_IO=p.k_IO,
+            k_IC=p.k_IC,
+            k_CI=p.k_CI,
+            k_B=p.k_B,
+            E_open=p.E_open,
+            E_inter=p.E_inter,
+            E_closed=p.E_closed,
+            P_O0=p.P_O0,
+            P_C0=p.P_C0,
+            f_dyn=fit_b.f_dyn,
+            E_static=fit_b.E_static,
+        )
+        return rec
+    except Exception:
+        # Fit failed for this replicate, return None
+        return None
+
 def bootstrap_condition_params(
     t: np.ndarray,
     E_mat: np.ndarray,
@@ -610,7 +688,7 @@ def bootstrap_condition_params(
     if not cols_subset:
         raise ValueError(f"No columns for {group_by}={group_key}")
 
-    # build submatrix for this condition
+    # Build submatrix for this condition (once)
     name_to_idx = {c: i for i, c in enumerate(col_names)}
     idx_all = [name_to_idx[c] for c in cols_subset if c in name_to_idx]
     E_full = E_mat[:, idx_all]
@@ -619,35 +697,24 @@ def bootstrap_condition_params(
     t_sub = t[row_valid]
     E_sub = E_full[row_valid, :]
 
-    rng = np.random.default_rng(random_seed)
-    records = []
+    print(f"Starting {n_boot} parallel bootstrap fits for {group_key}...")
 
-    for b in range(n_boot):
-        # resample trajectories with replacement
-        idx_boot = rng.integers(0, E_sub.shape[1], size=E_sub.shape[1])
-        E_boot = E_sub[:, idx_boot]
+    # --- PARALLEL EXECUTION ---
+    # We pass t_sub and E_sub (large arrays) once,
+    # and iterate over the unique seeds.
+    # verbose=5 will show a progress bar
+    results = Parallel(n_jobs=-1, verbose=5)(
+        delayed(_bootstrap_worker)(t_sub, E_sub, random_seed + b)
+        for b in range(n_boot)
+    )
+    # ------------------------
 
-        try:
-            fit_b = fit_global_3state(t_sub, E_boot)
-        except Exception:
-            continue
+    # Unpack results, filtering out any failed (None) runs
+    records = [res for res in results if res is not None]
 
-        p = fit_b.params
-        rec = dict(
-            k_OI=p.k_OI,
-            k_IO=p.k_IO,
-            k_IC=p.k_IC,
-            k_CI=p.k_CI,
-            k_B=p.k_B,
-            E_open=p.E_open,
-            E_inter=p.E_inter,
-            E_closed=p.E_closed,
-            P_O0=p.P_O0,
-            P_C0=p.P_C0,
-            f_dyn=fit_b.f_dyn,
-            E_static=fit_b.E_static,
-        )
-        records.append(rec)
+    if not records:
+        print(f"Warning: All {n_boot} bootstrap fits failed for {group_key}.")
+        return pd.DataFrame()
 
     return pd.DataFrame(records)
 
@@ -735,8 +802,8 @@ def main():
     cond_A = "Hsp90_409_601_241107"
     cond_B = "Hsp90_409_601_241108"
 
-    boot_A = bootstrap_condition_params(t, E_mat, col_names, meta, cond_A, n_boot=200)
-    boot_B = bootstrap_condition_params(t, E_mat, col_names, meta, cond_B, n_boot=200)
+    boot_A = bootstrap_condition_params(t, E_mat, col_names, meta, cond_A, n_boot=100)
+    boot_B = bootstrap_condition_params(t, E_mat, col_names, meta, cond_B, n_boot=100)
 
     for param in ["k_OI", "k_IC", "f_dyn", "E_closed"]:
         mA, loA, hiA = summarize_bootstrap(boot_A, param)
