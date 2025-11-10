@@ -1,3 +1,58 @@
+'''
+BSD 3-Clause License
+
+Copyright (c) 2025, Abhinav Mishra
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+3. Neither the name of the copyright holder nor the names of its
+   contributors may be used to endorse or promote products derived from
+   this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+'''
+
+"""
+HDF5 FRET Tracking Data Processor
+=================================
+
+This script processes single-molecule FRET tracking data stored in HDF5 format.
+It is designed to inspect raw data, filter and export individual particle
+trajectories, and combine them into a unified time-series matrix.
+
+The workflow consists of three main stages:
+1.  **Inspection**: Iterates through all track files, logging metadata,
+    data dimensions, and basic statistics. Plots a representative trajectory
+    for each file to aid in quick quality control.
+2.  **Export**: Reads raw data again, applies validity filters (FRET range,
+    minimum trajectory length), and saves each valid particle's trace as an
+    individual CSV file in a designated output directory.
+3.  **Combination**: Reads all exported individual CSVs, determines a global
+    time vector, and interpolates all traces onto this uniform grid using
+    cubic splines (or linear interpolation for short traces). The result is a
+    single matrix where columns represent individual molecules and rows represent
+    synchronized time points.
+"""
+
+import logging
 import pandas as pd
 from pathlib import Path
 import numpy as np
@@ -6,24 +61,40 @@ import warnings
 
 from scipy.interpolate import CubicSpline
 
+# === Logger Setup ===
+# Configured to mimic 'print' output cleanly while allowing for future redirection/levels
+logging.basicConfig(level=logging.INFO, format='%(message)s')
+logger = logging.getLogger(__name__)
+
 warnings.filterwarnings("ignore", category=UserWarning, module="pandas")
 
 # === Configuration ===
 data_dir = Path("data/Hugel_2025")   # adjust path
 key = "/tracks/Data"                 # default key
-frame_interval = 0.05                # seconds per frame
-fret_max = 2                       # max FRET efficiency to consider
-fret_min = 0                      # min FRET efficiency to consider
+frame_interval = 0.1                # seconds per frame
+fret_max = 2                         # max FRET efficiency to consider
+fret_min = 0.16                         # min FRET efficiency to consider
+USE_INTERPOLATION = False             # Set to False to disable cubic splines/filling
 
 def interpolate_trace(time_grid: np.ndarray,
                       t_trace: np.ndarray,
-                      E_trace: np.ndarray) -> np.ndarray:
+                      E_trace: np.ndarray,
+                      interpolate: bool = True) -> np.ndarray:
     """
-    Interpolate a single FRET trace onto a common time grid using cubic splines
-    where possible. Handles NaNs and short traces robustly.
+    Interpolate a single FRET trace onto a common time grid using cubic splines.
 
-    Returns an array of shape time_grid with NaNs outside the observed range
-    or when not enough data points are available.
+    Handles edge cases such as missing data (NaNs), single-point traces,
+    and short traces where only linear interpolation is feasible.
+
+    Args:
+        time_grid (np.ndarray): The uniform time vector to interpolate onto.
+        t_trace (np.ndarray): Original time points of the trace.
+        E_trace (np.ndarray): Original FRET efficiency values.
+
+    Returns:
+        np.ndarray: The FRET trace interpolated onto `time_grid`. Returns NaNs
+        for time points outside the original observation range or if
+        insufficient data exists.
     """
     # Ensure arrays
     t_trace = np.asarray(t_trace, float)
@@ -43,9 +114,25 @@ def interpolate_trace(time_grid: np.ndarray,
         idx = np.argmin(np.abs(time_grid - t_clean[0]))
         y[idx] = E_clean[0]
         return y
+
     # Remove duplicate time stamps, if any
     t_unique, idx_unique = np.unique(t_clean, return_index=True)
     E_unique = E_clean[idx_unique]
+
+    if not interpolate:
+        y = np.full_like(time_grid, np.nan, dtype=float)
+        if len(time_grid) > 1:
+            dt = time_grid[1] - time_grid[0]
+            # Find nearest grid index for each observation
+            idx = np.rint(t_unique / dt).astype(np.int64)
+            # Ensure indices are within bounds
+            valid = (idx >= 0) & (idx < len(time_grid))
+            y[idx[valid]] = E_unique[valid]
+        elif len(time_grid) == 1 and t_unique.size > 0:
+            # Edge case: 1-point grid, just take the first point if close enough
+            if np.abs(t_unique[0] - time_grid[0]) < frame_interval / 2:
+                y[0] = E_unique[0]
+        return y
 
     if t_unique.size < 2:
         return np.full_like(time_grid, np.nan, dtype=float)
@@ -71,7 +158,7 @@ def interpolate_trace(time_grid: np.ndarray,
 
 # === Inspect and plot data ===
 for path in sorted(data_dir.glob("*.tracks*")):
-    print("=" * 80)
+    logger.info("=" * 80)
 
     # Extract metadata from filename
     fname = path.stem  # e.g. filtered-241107-Hsp90_409_601-v014.tracks
@@ -83,17 +170,17 @@ for path in sorted(data_dir.glob("*.tracks*")):
         exp_id = "unknown"
         construct = "unknown"
 
-    print(f"File: {path.name}")
-    print(f"Experiment: {construct}, Date/ID: {exp_id}")
+    logger.info(f"File: {path.name}")
+    logger.info(f"Experiment: {construct}, Date/ID: {exp_id}")
 
     # Step 1 — list keys
     try:
         store = pd.HDFStore(path, mode="r")
         keys = store.keys()
         store.close()
-        print(f"Keys in file: {keys}")
+        logger.info(f"Keys in file: {keys}")
     except Exception as e:
-        print(f"Could not open file: {e}")
+        logger.error(f"Could not open file: {e}")
         continue
 
     # Step 2 — read dataset
@@ -101,7 +188,7 @@ for path in sorted(data_dir.glob("*.tracks*")):
     try:
         df = pd.read_hdf(path, key=k)
     except Exception as e:
-        print(f"Error reading {k}: {e}")
+        logger.error(f"Error reading {k}: {e}")
         continue
 
     # Step 3 — flatten multiindex columns
@@ -109,34 +196,34 @@ for path in sorted(data_dir.glob("*.tracks*")):
         df.columns = ["_".join(filter(None, col)).strip() for col in df.columns]
 
     # Step 4 — basic info
-    print(f"Loaded with shape: {df.shape}")
-    print(f"Columns ({len(df.columns)}):")
-    print("   " + ", ".join(df.columns[:10]) + ("..." if len(df.columns) > 10 else ""))
-    print()
+    logger.info(f"Loaded with shape: {df.shape}")
+    logger.info(f"Columns ({len(df.columns)}):")
+    logger.info("   " + ", ".join(df.columns[:10]) + ("..." if len(df.columns) > 10 else ""))
+    logger.info("")
 
     # Step 5 — show sample rows
-    print(df.head(5))
-    print()
+    logger.info(df.head(5))
+    logger.info("")
 
     # Step 6 — numeric summary
     num_cols = df.select_dtypes(include=[np.number]).columns
     summary = df[num_cols].describe().T[["mean", "std", "min", "max"]]
-    print("Numeric summary (mean ± std, min–max):")
-    print(summary.head(10))
-    print()
+    logger.info("Numeric summary (mean ± std, min–max):")
+    logger.info(summary.head(10))
+    logger.info("")
 
     # Step 7 — add time column
     if "donor_frame" in df.columns:
         df["time_s"] = df["donor_frame"] * frame_interval
-        print(f"Added time_s (first 5): {df['time_s'].head().tolist()}")
-    print()
+        logger.info(f"Added time_s (first 5): {df['time_s'].head().tolist()}")
+    logger.info("")
 
     # Step 8 — detect FRET column
     fret_candidates = ["fret_eff", "fret_eff_app", "fret_efficiency"]
     fret_col = next((c for c in fret_candidates if c in df.columns), None)
 
     if fret_col is None:
-        print(f"No FRET column found (checked: {', '.join(fret_candidates)}). Skipping plot.\n")
+        logger.warning(f"No FRET column found (checked: {', '.join(fret_candidates)}). Skipping plot.\n")
         continue
 
     # Ensure we have a time axis
@@ -144,7 +231,7 @@ for path in sorted(data_dir.glob("*.tracks*")):
         if "donor_frame" in df.columns:
             df["time_s"] = df["donor_frame"] * frame_interval
         else:
-            print("No donor_frame/time info found. Skipping plot.\n")
+            logger.warning("No donor_frame/time info found. Skipping plot.\n")
             continue
 
     # Choose a representative particle: longest trajectory
@@ -183,13 +270,13 @@ for path in sorted(data_dir.glob("*.tracks*.h5")):
         exp_id = "unknown"
         construct = "unknown"
 
-    print(f"\nExporting per-particle time series from: {path.name}")
-    print(f"Experiment: {construct}, Date/ID: {exp_id}")
+    logger.info(f"\nExporting per-particle time series from: {path.name}")
+    logger.info(f"Experiment: {construct}, Date/ID: {exp_id}")
 
     try:
         df = pd.read_hdf(path, key="/tracks/Data")
     except Exception as e:
-        print(f"Could not read {path.name}: {e}")
+        logger.error(f"Could not read {path.name}: {e}")
         continue
 
     # flatten columns
@@ -199,7 +286,7 @@ for path in sorted(data_dir.glob("*.tracks*.h5")):
     # ensure required columns
     needed_cols = {"donor_frame", "fret_particle"}
     if not needed_cols.issubset(df.columns):
-        print("Missing required columns, skipping.")
+        logger.warning("Missing required columns, skipping.")
         continue
 
     df["time_s"] = df["donor_frame"] * frame_interval
@@ -207,7 +294,7 @@ for path in sorted(data_dir.glob("*.tracks*.h5")):
     fret_candidates = ["fret_eff", "fret_eff_app"]
     fret_col = next((c for c in fret_candidates if c in df.columns), None)
     if fret_col is None:
-        print("No FRET efficiency column found, skipping file.")
+        logger.warning("No FRET efficiency column found, skipping file.")
         continue
 
     if "filter_manual" in df.columns:
@@ -230,16 +317,16 @@ for path in sorted(data_dir.glob("*.tracks*.h5")):
         out.to_csv(export_dir / out_name, index=False)
         count += 1
 
-    print(f"Exported {count} per-particle traces to {export_dir}/")
+    logger.info(f"Exported {count} per-particle traces to {export_dir}/")
 
 
 # === Combine all exported trajectories into a single matrix ===
 combined_out = export_dir / "combined_fret_matrix.csv"
-print("\nBuilding combined FRET matrix (uniform 0–max_t grid)...")
+logger.info("\nBuilding combined FRET matrix (uniform 0–max_t grid)...")
 
 csv_files = sorted(export_dir.glob("*.csv"))
 if not csv_files:
-    print("No per-particle CSV files found, skipping matrix creation.")
+    logger.warning("No per-particle CSV files found, skipping matrix creation.")
 else:
     max_t = 0.0
 
@@ -260,7 +347,7 @@ else:
 
         t_trace = df["time_s"].values
         E_trace = df["FRET"].values
-        interp = interpolate_trace(time_grid, t_trace, E_trace)
+        interp = interpolate_trace(time_grid, t_trace, E_trace, interpolate=USE_INTERPOLATION)
 
         stem = f.stem
         parts = stem.split("-")
@@ -277,11 +364,10 @@ else:
         columns[col_name] = interp
 
         if (i + 1) % 100 == 0:
-            print(f"Processed {i + 1} traces ...")
+            logger.info(f"Processed {i + 1} traces ...")
 
     # Build one DataFrame in a single allocation
     combined = pd.DataFrame(columns)
     combined.to_csv(combined_out, index=False)
-    print(f"Combined matrix saved → {combined_out}")
-    print(f"Time points: {len(time_grid)}, trajectories: {combined.shape[1] - 1}")
-
+    logger.info(f"Combined matrix saved → {combined_out}")
+    logger.info(f"Time points: {len(time_grid)}, trajectories: {combined.shape[1] - 1}")
